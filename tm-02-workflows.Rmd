@@ -1,0 +1,214 @@
+---
+title: "Tidymodels: Workflows"
+author: 'Luca Baggi'
+output: html_notebook
+---
+
+# Load packages & set seed
+
+For reproducibility purposes:
+
+```{r}
+set.seed(42)
+```
+
+Load the packages:
+
+```{r, message = FALSE}
+library(tidymodels)
+
+# helper packages
+library(nycflights13)    # for flight data
+library(skimr)           # for variable summaries
+```
+
+# Data preprocessing
+
+Also, how to use `dplyr` at the next level, ft. Mark Khun:
+
+```{r}
+flight_data <-
+  flights %>%
+  mutate(
+    # convert arrival delay to a factor:
+    arr_delay = factor(ifelse(arr_delay >= 30, 'late', 'on_time')),
+    # date, for future use:
+    date = as.Date(time_hour)
+  ) %>%
+  # perform a inner_join to include weather data
+  inner_join(weather, by = c('origin', 'time_hour')) %>%
+  # retain the columns that will be used:
+  select(dep_time, flight, origin, dest, air_time, distance, 
+         carrier, date, arr_delay, time_hour) %>%
+  # exclude missing data:
+  na.omit() %>%
+  # mutate qualitative columns as factors:
+  mutate_if(is.character, as.factor)
+```
+
+Notes for me:
+1. `ifelse()` is smarter than `replace`;
+2. Use multiple lines statements within `mutate()` to change multiple lines at a time;
+3. `joins()` references are [here](https://www.rdocumentation.org/packages/dplyr/versions/0.7.8/topics/join);
+4. Use `na.omit()` more often;
+5. Remember to `mutate_if()` to turn characters into factors.
+
+To count the share of flights which arrived late, just:
+
+```{r}
+flight_data %>% 
+  count(arr_delay) %>% 
+  mutate(prop = n/sum(n))
+```
+This works too, albeit less elegant.
+
+```{r}
+flight_data %>%
+  select(arr_delay) %>%
+  table() %>%
+  prop.table()
+```
+
+# Data Splitting
+
+```{r}
+data_split <- initial_split(flight_data)
+
+train_data <- training(data_split)
+test_data <- testing(data_split)
+```
+
+# Create recipes and roles
+
+Roles are customarily given to label some variables. For example, we might build this recipe for our data. In this way, it won't be included in the model fitting! Variables can be retained from the data when creating a model.
+
+```
+flight_recipe <- train_data %>%
+  recipe(arr_delay ~ .) %>%
+  update_role(flight, time_hour, new_role = 'ID')
+```
+
+Default roles are `predictor` and response, so updating the role we effectively take them out of the formula. In other words, we are changing their `selector`!
+
+Then we can engineer many more variables thanks to `recipes`! `step_*` are numerous!
+
+## Feature engineering 
+
+Much better than turning the date in numeric, we can add more `step`s to the recipe.
+
+As a reminder, we can use:
+
+```
+flight_data %>%
+  distict(date) %>% # select every unique instance of the argument
+  mutate(numeric_date = as.numeric(date))
+```
+
+Let's manipulate data with `recipes`. We will also use `timeDate::listHolidays()`, whose docs are [here](https://rdrr.io/cran/timeDate/man/holiday-Listing.html).
+
+```{r recipe}
+flight_recipe <- train_data %>%
+  recipe(arr_delay ~ .) %>%
+  update_role(flight, time_hour, new_role = 'ID') %>%
+  # step_date() creates new features starting from date objects
+  # features requires a concatenation of 'dow' (day of week), 'month' or 'year'...
+  step_date(date, features = c('dow', 'month', 'week')) %>%
+  # step_holiday will create a binary variable for holidays!
+  # it requires a c concatenation, but one can also fill it with the whole holidays:
+  step_holiday(date, holidays = timeDate::listHolidays('US')) %>%
+  # step_date does not remove the argument, so we have to do it manually
+  step_rm(date) %>%
+  # deal with dummies:
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  # finally, remove zero-variance dummies, i.e., those that occur only once:
+  step_zv(all_predictors())
+```
+
+References for dummy variables can be found in [this book](https://bookdown.org/max/FES/creating-dummy-variables-for-unordered-categories.html).
+
+# Model Fitting
+
+We start by creating the model:
+
+```{r logistic-model}
+logistic_model <- logistic_reg() %>%
+  set_engine('glm')
+```
+
+Then we create a `workflow`:
+
+```{r workflow}
+flights_workflow <- workflow() %>%
+  add_model(logistic_model) %>%
+  add_recipe(flight_recipe)
+
+flights_workflow
+```
+
+Then we fit the model:
+
+```{r fit}
+flights_fit <- flights_workflow %>%
+  fit(data = train_data)
+```
+
+Then we can extract both the recipe and the fit with the helper commands.
+
+```{r extract_fit}
+flights_fit %>%
+  pull_workflow_fit() %>%
+  broom::tidy()
+```
+
+We can also use other methods of `broom`:
+
+```{r}
+flights_fit %>%
+  pull_workflow_fit() %>%
+  broom::glance()
+```
+
+# Predictions
+
+Are much, much faster: just a function call!
+
+```{r}
+predict(flights_fit, test_data)
+```
+
+As the result is a `tibble`, we can `bind_cols` to a new variable!
+
+```{r}
+predictions <- flights_fit %>%
+  # predict the probabilities of each class
+  predict(test_data, type = 'prob') %>%
+  # bind the predictions for the class
+  bind_cols(flights_fit %>% predict(test_data)) %>%
+  bind_cols(test_data %>% select(arr_delay, time_hour, flight))
+
+predictions
+```
+
+# Model Evaluation
+
+Let's start with my beloved confusion matrix:
+
+```{r}
+predictions %>%
+  conf_mat(arr_delay, .pred_class) %>%
+  autoplot(type = 'heatmap')
+```
+The number of true negatives (1702) is much smaller than the number of false positives (11391).
+
+Let's use the receiver operating characteristic (ROC) curve.
+
+```{r}
+predictions %>%
+  roc_curve(arr_delay, .pred_late) %>%
+  autoplot()
+
+# return the measure of the ROC area under the curve (AUC)
+predictions %>%
+  roc_auc(arr_delay, .pred_late)
+```
+

@@ -1,0 +1,154 @@
+---
+title: "Getting Started with Tidymodels"
+author: 'Luca Baggi'
+output: html_notebook
+---
+
+# Load the libraries:
+
+```{r}
+# Main framework
+library(tidymodels)
+
+# Helper packages
+library(readr)       # for importing data
+library(broom.mixed) # for converting bayesian models to tidy tibbles
+library(dotwhisker)  # for visualizing regression results
+```
+
+And set the seed;
+
+```{r}
+set.seed(42)
+```
+
+# Load the data
+
+```{r}
+urchins <- read_csv("https://tidymodels.org/start/models/urchins.csv") %>% 
+  # Change the columns names to be a little more verbose
+  setNames(c("food_regime", "initial_volume", "width")) %>% 
+  # Factors are very helpful for modeling, so we convert one column
+  mutate(food_regime = factor(food_regime, levels = c("Initial", "Low", "High")))
+```
+
+Let's use `prop.table()` to show the ratios of the observations per `food_regime`:
+
+```{r}
+table(urchins$food_regime) %>% prop.table()
+```
+
+This is lucky, but it happens because the data has been purposefully created.
+
+# Visualisations
+
+```{r}
+urchins %>%
+  ggplot() +
+  # colorise by food regime
+  aes(initial_volume, width, col = food_regime) +
+  geom_point() +
+  # and add a linear regression
+  geom_smooth(method = 'lm')
+```
+
+We leave the confidence intervals (CI) as they indicate where the estimate is distorted by a lack of data in a specific region. Still, it is clear that there might be a pattern for classification!
+
+
+# Model fitting
+No data pre-processing is done in this tutorial; we will predict a new value outside of this dataset.
+
+We define our linear model:
+
+```{r}
+lm_urchins <- linear_reg() %>%
+  set_engine('lm') %>%
+  fit(width ~ initial_volume * food_regime, data = urchins)
+```
+
+And then visualise it in the `tidy` format:
+
+```{r}
+lm_urchins %>% tidy()
+```
+
+Also, note that the regression automatically adds the base terms and plots the coefficients for each level interaction.
+
+## Better visualise the outcomes of the regression
+
+This step is needed to generate a dot-and-whisker plot with `dwplot`. The vanilla command prints red elements. We can tweak it to make them a different colour. However, we can add a vertical line to indicate the zero level.
+
+```{r}
+lm_urchins %>% tidy() %>%
+  dwplot(
+    vline = geom_vline(xintercept = 0, colour = 'grey', lintype = 2)
+  )
+```
+
+This signals that the only statistically significant variable is the initial volume and the interaction with the `low` food regime: all of the others cross the 0 boundary, so they are not different from zero at the 95% significance level.
+
+# Model predictions
+
+Let's create some new points:
+
+```{r}
+# expand.grid() is a base function that creates a dataframe out of the inputs' combinations.
+new_points <- expand.grid(initial_volume = 20,
+                          food_regime = c('Initial', 'Low', 'High'))
+```
+
+And see what comes out (a tibble):
+
+```{r}
+new_points
+```
+
+To make a prediction, let's get back to our model, `lm_urchins`, and apply it to the predictions with the `predict()` command. The command returns a tibble. **It has the same size as the `new_points` tibble, so we can bind the new columns to it!**.
+
+```{r}
+new_points <- lm_urchins %>%
+  predict(new_data = new_points) %>%
+  bind_cols(new_points)
+```
+
+We can also use the model to compute the predicted confidence intervals and bind them to the tibble of the predicted results!
+
+```{r}
+new_points <- lm_urchins %>%
+  predict(new_data = new_points,
+          type = 'conf_int') %>%
+  bind_cols(new_points)
+```
+
+```{r}
+new_points
+```
+
+
+And we can plot this with the `dwplot` package:
+
+```{r}
+new_points %>%
+  ggplot() +
+  aes(x = food_regime) +
+  geom_point(aes(y = .pred)) +
+  geom_errorbar(aes(ymin = .pred_lower,
+                    ymax = .pred_upper),
+                width = 0.2) +
+  labs(y = 'urchins size')
+```
+
+
+# Using a different engine
+
+We can use `stan` to create a bayesian linear model. We need to specify the `prior` distribution of the parameter (recall, this is the main difference between frequentist and bayesian analysis). We are given a Cauchy distribution, which is simply a t with one degree of freedom.
+
+```{r}
+library(rstanarm) # error in installation, lol
+```
+
+
+```{r}
+param_distribution = rstanarm::student_t(df = 1)
+```
+
