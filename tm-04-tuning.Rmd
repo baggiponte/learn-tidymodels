@@ -3,3 +3,203 @@ title: "Tidymodels: Tune Model Parameters"
 author: 'Luca Baggi'
 output: html_notebook
 ---
+
+# Load packages
+
+```{r, message = FALSE}
+library(tidymodels)  # for the tune package, along with the rest of tidymodels
+
+# Helper packages
+library(modeldata)   # for the cells data
+library(vip)         # for variable importance plots
+```
+
+# Load Data
+
+```{r data}
+data("cells", package = "modeldata")
+cells
+```
+
+# Split data
+
+```{r split}
+cells_split <-
+  cells %>%
+  # remove the unneded column:
+  select(-case) %>%
+  # split:
+  initial_split(strata = class)
+
+cells_train <- cells_split %>% training()
+cells_test <- cells_split %>% testing()
+```
+
+# Model Specification
+
+## Specify the model
+
+When we specify the parameters, we write `tune()` as a placeholder:
+
+```{r model-to-tune}
+cells_tree_to_tune <-
+  decision_tree(
+    # set parameters to tune:
+    cost_complexity = tune(),
+    tree_depth = tune()
+  ) %>%
+  set_engine('rpart') %>%
+  set_mode('classification')
+  
+cells_tree_to_tune
+```
+
+### Hyperparameters grid
+
+Then we need to specify a `grid` of hyper-parameters to tune:
+
+```{r hypergrid}
+cells_tree_hypergrid <-
+  # from the dials package
+  grid_regular(cost_complexity(),
+               tree_depth(),
+               levels = 5)
+
+cells_tree_hypergrid
+```
+
+### Cross-validation folds
+
+```{r folds}
+# for reproducibility purposes:
+set.seed(42)
+
+cells_folds <-
+  vfold_cv(cells_train)
+```
+
+## Hyperparameters tuning
+
+Let's define a workflow:
+
+```{r workflow}
+cells_workflow <-
+  workflow() %>%
+  add_model(cells_tree_to_tune) %>%
+  # we have no recipe, just add a formula:
+  add_formula(class ~ .)
+```
+
+And then apply the function `tune_grid()` to it:
+
+```{r workflow+grid}
+cells_tuned <-
+  cells_workflow %>%
+  tune_grid(
+    # specify the resamples:
+    resamples = cells_folds,
+    # spec the grid:
+    grid = cells_tree_hypergrid
+  )
+
+cells_tuned
+```
+And then we collect the metrics:
+
+```{r tuning-metrics}
+cells_tuned %>%
+  collect_metrics()
+```
+
+But, much better, we can plot these:
+
+```{r tuning-plot}
+cells_tuned %>%
+  collect_metrics() %>%
+  # transform the tree_depth in factors
+  mutate(tree_depth = factor(tree_depth)) %>%
+  # define mapping
+  ggplot(aes(cost_complexity, mean, col = tree_depth)) +
+  # add lines and points
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  # add a facet wrap, ie a plot for each metric
+  # specify the metric with the first argument, as if it was a formula
+  facet_wrap(~ .metric, nrow = 2, scale = 'free') +
+  # actually, I don't fully get it: scales the labels?
+  scale_x_log10(labels = scales::label_number()) +
+  # change colours
+  scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
+```
+
+We display the best model via the following command:
+
+```{r best-model}
+# rank models
+cells_tuned %>%
+  show_best('roc_auc')
+
+# pull out the best
+cells_tuned %>%
+  select_best('roc_auc')
+
+```
+We can store the best model into a variable and use it to finalise our workflow:
+
+```{r final-workflow}
+cells_best_model <-
+  cells_tuned %>%
+  select_best('roc_auc')
+
+cells_final_workflow <-
+  cells_workflow %>%
+  finalize_workflow(cells_best_model)
+
+cells_final_workflow
+```
+
+# Model Fitting
+
+Let's fit the finalised model:
+
+```{r model-fitting}
+cells_tree_final <-
+  cells_final_workflow %>%
+  fit(cells_train)
+
+cells_tree_final
+```
+
+`cells_tree_final` has the finalised, fitted model inside. We can extract it via `pull_workflow_fit`, and use `vip` to rank the features in order of importance.
+
+```{r}
+cells_tree_final %>%
+  pull_workflow_fit() %>%
+  vip()
+```
+
+The rest can be done waaaay faster using `last_fit()`:
+
+```{r final-fit}
+final_tree_fit <-
+  cells_final_workflow %>%
+  last_fit(cells_split)
+```
+
+And from here we can `collect_metrics()` and `collect_predictions()`:
+
+```{r}
+final_tree_fit %>%
+  collect_metrics()
+
+final_tree_fit %>%
+  collect_predictions() %>%
+  # arguments are the hard predictions (probabilities)
+  roc_curve(class, .pred_PS) %>%
+  autoplot()
+
+final_tree_fit %>%
+  collect_predictions() %>%
+  roc_auc(class, .pred_PS)
+```
+

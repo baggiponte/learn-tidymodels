@@ -141,7 +141,6 @@ cells_rf_fit_resampling <-
   cells_workflow %>%
   # specify the resample object
   fit_resamples(cells_fold)
-  # we do not specify the fit() attribute as the formula is included in the workflow!
 
 cells_rf_fit_resampling
 ```
@@ -152,6 +151,10 @@ The `.metrics` contains, indeed, the metrics of the model. Instead of manually e
 cells_rf_fit_resampling %>%
   collect_metrics()
 ```
+
+## Quick memo
+`fit_resamples()` does not perform any tuning: that is done by `tune_grid()`. The former command only performs the fitting on the resamples (e.g., the folds).
+
 # Predictions
 
 Suppose we are done with tuning and this is our final model. We can then proceed to predictions:

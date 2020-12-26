@@ -1,0 +1,491 @@
+---
+title: "Tidymodels: Putting all together"
+author: 'Luca Baggi'
+output: html_notebook
+---
+
+# Load packages
+
+```{r packages, message = FALSE}
+library(tidymodels)
+
+#helper packages
+library(readr)
+library(vip)
+library(curl)
+```
+
+
+# Load data
+
+```{r data}
+hotels <-
+  read_csv('https://tidymodels.org/start/case-study/hotels.csv') %>%
+  mutate_if(is.character, as.factor)
+
+hotels
+```
+The data was modified to exclude cancelled stays: indeed, for these the data is different, as many observations for canceled trips are missing. The author points out that this won't lead to an accurate model of classification. The variable chosen for prediction is `children`:
+
+```{r}
+hotels %>%
+  count(children) %>%
+  mutate(prop = n/sum(n))
+```
+
+
+# Data splitting
+
+As to deal with class imbalance, we stratify our split:
+
+```{r splitting}
+set.seed(42)
+
+hotel_split <-
+  initial_split(hotels,
+                strata = children)
+
+hotel_test <- testing(hotel_split)
+hotel_other <- training(hotel_split)
+```
+
+We created `hotel_other` as we will use a simpler technique to create the validation set (and to avoid fusing my CPU, too):
+
+```{r}
+validation_set <-
+  validation_split(hotel_other,
+                   strata = children,
+                   prop = 0.8)
+
+# it does return a 1x2 tibble!
+```
+
+
+# Model 1: Logistic regression
+## Model specification
+
+Since the data is categorical, we can employ a logistic regression to classify it. Let's use the package `glmnet`.
+
+```{r}
+logistic_model <-
+  logistic_reg(
+    penalty = tune(),
+    mixture = 1 # the model will remove irrelevant predictors
+  ) %>%
+  set_engine('glmnet') %>%
+  # this is redundant, as logistic is only meant for classifying.
+  set_mode('classification')
+```
+
+## Recipes
+
+```{r}
+logistic_recipe <-
+  # specify the formula
+  recipe(children ~ ., data = hotel_other) %>%
+  # if no `features =` is specified, defaults are day of week (dow), month, year
+  step_date(arrival_date) %>%
+  step_holiday(arrival_date, holidays = timeDate::listHolidays('US')) %>%
+  step_rm(arrival_date) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())
+```
+
+## Workflow
+
+```{r}
+logistic_workflow <-
+  workflow() %>%
+  add_recipe(logistic_recipe) %>%
+  add_model(logistic_model)
+```
+
+## Tuning
+
+### Create a grid
+
+In `04` we used the `grid_regular()` to check for every possible combination of the given levels of hyperparameters. Since here we only have one, we might as well create an individual `tibble`.
+
+To create a sequence:
+
+```{r}
+seq(-4, -1, length.out = 31)
+```
+
+```{r}
+logistic_hypergrid <-
+  tibble (
+    penalty = 10^seq(-4, -1, length.out = 31)
+  )
+  
+logistic_hypergrid %>% head()
+```
+
+
+
+
+### Tune the parameters
+
+Let's finally use `tune_grid()`. It has a plethora of parameters: in the last exercise, we specified the arguments `grid` and `resamples`. Here we will add `metrics` and the `control`, to store predictions of the validation set.
+
+```{r}
+logistic_tuning_results <-
+  logistic_workflow %>%
+  tune_grid(
+    # specify the validation set
+    validation_set,
+    # grid
+    grid = logistic_hypergrid,
+    # save validation predictions
+    control = control_grid(save_pred = TRUE),
+    # set the metrics
+    metrics = metric_set(roc_auc)
+  )
+
+logistic_tuning_results %>%
+  # automatically extract the .metrics sub-tibble:
+  collect_metrics() %>%
+  # see the top ones
+  head()
+```
+
+And then we extract the metrics:
+
+```{r}
+logistic_tuning_results %>%
+  # the only hyperparam here is penalty!
+  collect_metrics() %>%
+  ggplot(aes(penalty, mean)) +
+  geom_line() +
+  geom_point() +
+  # log the x scale, display the ticks without scientific notation
+  scale_x_log10(labels = scales::label_number()) +
+  ylab('ROC AUC for each penalty value')
+```
+The plot tells us that there aren't many irrelevant variables: the AUC drops quickly to 50% (i.e., no better than guessing) as the penalty becomes too big.
+
+The curve is flat for the initial values of `penalty`. We could select the best accuracy, but one could argue the first value before the AUC declines is the one to pick: it means less predictors will be used.
+
+```{r}
+logistic_tuning_results %>%
+  collect_metrics() %>%
+  arrange(penalty)
+```
+
+## Model validation
+
+We can store the best model in the following:
+
+```{r}
+logistic_best <-
+  logistic_tuning_results %>%
+  select_best()
+```
+
+And we can plot its AUC:
+
+```{r}
+logistic_tuning_results %>%
+  collect_predictions(parameters = logistic_best) %>%
+  roc_curve(children, .pred_children) %>%
+  autoplot()
+```
+Despite our tinkering, the model is not great.
+
+Let's store this curve in a variable and add to it a dummy indicating it comes from this model:
+
+```{r}
+logistic_roc <-
+  logistic_tuning_results %>%
+  # collect the predictions from the best model
+  collect_predictions(parameters = logistic_best) %>%
+  # select the ROC curve of the best model
+  roc_curve(children, .pred_children) %>%
+  # add a column 'model' with value 'logistic'
+  mutate(model = 'logistic')
+```
+
+
+
+
+# Model 2: Tree based ensemble
+
+> Each tree is non-linear, and aggregating across trees makes random forests also non-linear but more robust and stable compared to individual trees
+
+Despite the model being fairly good even with little preprocessing and default hyperparams, we may want to tweak them - and flex that `tune` can also do parallel processing. Or, at least, that's what we would do if we were using folds, created with `vfold_cv`.
+
+Luckily, `ranger` provides a command for parallelizing the computation. We only need to know the number of cores, via the `parallel` library:
+
+```{r}
+library(parallel)
+
+cores <- parallel::detectCores()
+cores # and cry
+```
+
+## Model specification
+
+Let's specify our model.
+
+```{r}
+forest_model <-
+  rand_forest(
+    # the parameters to tune
+    mtry = tune(),
+    min_n = tune(),
+    # the number of trees
+    trees = 1000
+  ) %>%
+  set_engine('ranger', num.threads = cores) %>%
+  set_mode('classification')
+```
+
+## Recipe
+
+Despite not requiring dummies nor other particular feature engineering, such as normalisation, we want to create a recipe for creating the time features.
+
+```{r}
+forest_recipe <-
+  recipe(children ~., data = hotel_other) %>%
+  step_date(arrival_date) %>%
+  step_holiday(arrival_date, holidays = timeDate::listHolidays('US')) %>%
+  step_rm(arrival_date)
+```
+
+## Workflow
+
+```{r}
+forest_workflow <-
+  workflow() %>%
+  add_recipe(forest_recipe) %>%
+  add_model(forest_model)
+
+forest_workflow
+```
+
+## Train and tune
+
+Display the workflow's parameters:
+
+```{r}
+forest_workflow %>%
+  parameters()
+```
+
+Thus we only need to tune `mtry`!
+
+> The mtry hyperparameter sets the number of predictor variables that each node in the decision tree “sees” and can learn about, so it can range from 1 to the total number of features present; when mtry = all possible features, the model is the same as bagging decision trees. The min_n hyperparameter sets the minimum n to split at any node.
+
+
+### Create the grid
+
+Now we do not need `grid_regular()`, again!
+
+```{r}
+set.seed(42)
+
+forest_tuning_results <-
+  forest_workflow %>%
+  tune_grid(
+    # validation set: is the same as above
+    validation_set,
+    # items in the grid to tune; the model will automatically detect the upper bound
+    grid = 25,
+    # save the predictions from the validation set
+    control = control_grid(save_pred = TRUE),
+    # set the metric
+    metrics = metric_set(roc_auc)
+  )
+```
+
+If you read this, it means one of two things:
+
+1. I interrupted the computation, as it was too much for my machine
+2. I made it through, after a long time and probably my CPU is molten
+
+(update: it must have taken a good 20')
+
+Anyway, let's rank the best models:
+
+```{r}
+forest_tuning_results %>%
+  show_best(metric = 'roc_auc')
+```
+
+And we can use `autoplot()` to graph the ROC AUC values for each hyperparameter value.
+
+```{r}
+forest_tuning_results %>%
+  autoplot()
+```
+
+The best model is:
+
+```{r}
+forest_best <-
+  forest_tuning_results %>%
+  select_best(metric = 'roc_auc')
+
+forest_best
+```
+
+And the AUC plot can be drawn with this command:
+
+```{r}
+forest_tuning_results %>%
+  collect_predictions(parameters = forest_best) %>%
+  roc_curve(children, .pred_children) %>%
+  autoplot()
+```
+
+And store it to a variable:
+
+```{r}
+forest_roc <-
+  forest_tuning_results %>%
+  # extract the predicted values of the best random forest
+  collect_predictions(parameter = forest_best) %>%
+  # use the actual and prediction columns to plot the ROC curve
+  roc_curve(children, .pred_children) %>%
+  # add the 'model' feature reporting it's the 'forest' model:
+  mutate(model = 'random_forest')
+```
+
+
+# Compare the two models
+
+We can use `forest_roc` and `logistic_roc` to plot the two models and make the final choice before predicting:
+
+```{r}
+roc_comparison <-
+  # add the logistic_roc at the end of the forest_roc
+  bind_rows(forest_roc, logistic_roc) %>%
+  # define plot aesthetics:
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) +
+  # geom_path interpolates the points
+  geom_path(
+    # adjust line width:
+    lwd = 1.5,
+    # transparency
+    alpha = 0.6
+  ) +
+  # add the diagonal line for 50% auc
+  geom_abline(lty = 3) + # speficy linetype
+  # adjust coordinates so that it is a square
+  coord_equal() +
+  # change colors
+  scale_color_viridis_d(option = 'plasma', end = 0.6)
+
+roc_comparison
+```
+So, we can safely choose the random forest as our model (after all of this work, that'd better be the case!).
+
+
+# Predictions
+
+## One expected path
+
+Normally, we would:
+
+```{r}
+best_tree_model <-
+  forest_workflow %>%
+  finalize_workflow(forest_best)
+
+best_tree_model
+```
+This would be followed by:
+
+```{r}
+forest_predictions <-
+  best_tree_model %>%
+  last_fit(hotel_split)
+```
+
+And we would use this final object to extract predictions and metrics:
+
+```{r}
+forest_predictions %>%
+  collect_metrics()
+
+forest_predictions %>%
+  collect_predictions() %>%
+  roc_curve(children, .pred_children) %>%
+  autoplot()
+```
+
+
+
+
+## What we actually do
+
+We define the random forest model once again (below, we only did a showoff of the `finalize_workflow()` command):
+
+```{r}
+final_model <-
+  rand_forest(
+    # set the hyperparams:
+    trees = 1000,
+    mtry = 7,
+    min_n = 3
+  ) %>%
+  set_engine('ranger',
+             # specify multicore
+             num.threads = cores,
+             # add a new argument:
+             importance = 'impurity'
+             ) %>%
+  # redundant, but does not hurt reminding
+  set_mode('classification')
+```
+
+And the final workflow: **we do not need to create a new one, just update the older one with the final model!**
+
+```{r}
+final_workflow <-
+  forest_workflow %>%
+  update_model(final_model)
+
+final_workflow
+```
+And then we compute the last fit:
+
+```{r}
+set.seed(42)
+
+final_fit <-
+  final_workflow %>%
+  last_fit(hotel_split)
+
+final_fit
+```
+
+Also, we can plot the variables for order of importance:
+
+```{r}
+library(purrr)
+
+final_fit %>%
+  # pluck is a generalised form of [[]]
+  # we pluck the '.workflow' tibble and select the first row...
+  pluck('.workflow', 1) %>%
+  # which contains the fit we wan to extract 
+  pull_workflow_fit() %>%
+  vip(num_features = 20)
+```
+
+
+Then, we collect the metrics and the predictions to compute one last ROC:
+
+```{r}
+final_fit %>%
+  collect_metrics()
+
+final_fit %>%
+  collect_predictions() %>%
+  roc_curve(children, .pred_children) %>%
+  autoplot()
+```
+
+
