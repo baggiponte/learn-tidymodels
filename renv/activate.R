@@ -2,7 +2,7 @@
 local({
 
   # the requested version of renv
-  version <- "0.12.3-61"
+  version <- "0.12.3-31"
 
   # the project directory
   project <- getwd()
@@ -59,7 +59,7 @@ local({
       return(repos)
   
     # if we're testing, re-use the test repositories
-    if (renv_tests_running())
+    if (renv_testing())
       return(getOption("renv.tests.repos"))
   
     # retrieve current repos

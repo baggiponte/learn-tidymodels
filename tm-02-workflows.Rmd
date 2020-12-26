@@ -4,13 +4,7 @@ author: 'Luca Baggi'
 output: html_notebook
 ---
 
-# Load packages & set seed
-
-For reproducibility purposes:
-
-```{r}
-set.seed(42)
-```
+# Load packages
 
 Load the packages:
 
@@ -72,6 +66,9 @@ flight_data %>%
 # Data Splitting
 
 ```{r}
+# for reproducibility purposes:
+set.seed(42)
+
 data_split <- initial_split(flight_data)
 
 train_data <- training(data_split)
@@ -128,7 +125,7 @@ References for dummy variables can be found in [this book](https://bookdown.org/
 
 # Model Fitting
 
-We start by creating the model:
+We start by specifying the model: fitting, as usual, will be done later.
 
 ```{r logistic-model}
 logistic_model <- logistic_reg() %>%
@@ -184,6 +181,7 @@ predictions <- flights_fit %>%
   predict(test_data, type = 'prob') %>%
   # bind the predictions for the class
   bind_cols(flights_fit %>% predict(test_data)) %>%
+  # bind the actual data columns
   bind_cols(test_data %>% select(arr_delay, time_hour, flight))
 
 predictions

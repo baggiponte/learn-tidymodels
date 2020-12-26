@@ -144,11 +144,11 @@ new_points %>%
 We can use `stan` to create a bayesian linear model. We need to specify the `prior` distribution of the parameter (recall, this is the main difference between frequentist and bayesian analysis). We are given a Cauchy distribution, which is simply a t with one degree of freedom.
 
 ```{r}
-library(rstanarm) # error in installation, lol
+# library(rstanarm) # error in installation, lol
 ```
 
 
 ```{r}
-param_distribution = rstanarm::student_t(df = 1)
+# param_distribution = rstanarm::student_t(df = 1)
 ```
 

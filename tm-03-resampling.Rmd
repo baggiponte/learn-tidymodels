@@ -1,0 +1,199 @@
+---
+title: "Tidymodels: Resampling"
+author: 'Luca Baggi'
+output: html_notebook
+---
+
+# Packages
+
+```{r packages, message = FALSE}
+# main package
+library(tidymodels)
+
+# helper package
+library(modeldata)
+```
+
+# load the data
+
+```{r}
+data("cells", package = "modeldata")
+cells
+```
+
+The response variable is `class`; note that `case` already specifies training and testing variables!
+
+The idea is to train a model to filter out the `PS`, i.e. *poorly segmented*, cells.
+
+Display the ratio of `PS` against `WS`:
+
+```{r}
+cells %>%
+  count(class) %>%
+  mutate(prop = n/sum(n))
+```
+This indicates that poorly segmented cells are as much as 50% more than the well segmented ones. There is class imbalance, which will be addressed in the next section.
+
+# Data splitting
+
+We start by removing the `case` column, which indicates the original split partition performed by the authors.
+
+```{r splitting}
+
+set.seed(42)
+
+cells_split <- initial_split(cells %>%
+                               # remove the unneded column:
+                               select(-case),
+                             # use stratified sampling:
+                             strata = class)
+
+cells_train <- cells_split  %>% training()
+cells_test <- cells_split %>% testing()
+```
+
+And we check how the data has been correctly stratified:
+
+```{r}
+cells_train %>%
+  count(class) %>%
+  mutate(prop = n/sum(n))
+
+cells_test %>%
+  count(class) %>%
+  mutate(prop = n/sum(n))
+```
+
+# Modeling
+
+Ensamble methods employ several, computationally-fast algorithms to hopefully develop a better predictive model. Random forests are an example in the field of supervised learning, and are made up of numerous decision trees.
+
+> The collection of trees are combined into the random forest model and, when a new sample is predicted, the votes from each tree are used to calculate the final predicted value for the new sample.
+
+However, these models are computationally expensive! Also, there won't be need for a recipe:
+
+> One of the benefits of a random forest model is that it is very low maintenance; it requires very little preprocessing of the data and the default parameters tend to give reasonable results.
+
+## Model specification
+
+We specify the model... 
+
+```{r model}
+cells_random_forest <-
+  rand_forest(trees = 1000) %>%
+  set_engine('ranger') %>%
+  set_mode('classification')
+```
+
+... and then fit it:
+
+```{r model_fit}
+cells_rf_fit <-
+  cells_random_forest %>%
+  fit(class ~ ., data = cells_train)
+
+cells_rf_fit
+```
+
+## Model Evaluation
+
+Model evaluation can be deceptive here:
+
+> Models like random forests, neural networks, and other black-box methods can essentially memorize the training set. Re-predicting that same set should always result in nearly perfect results.
+
+Furthermore, 
+
+> The training set does not have the capacity to be a good arbiter of performance. It is not an independent piece of information; predicting the training set can only reflect what the model already knows.
+
+Before doing so, we need to proceed to...
+
+# Resampling & Validation
+
+`rsample` provides functions to perform cross validation as well:
+
+```{r fold}
+set.seed(42)
+
+cells_fold <-
+  cells_train %>%
+  vfold_cv(v = 10)
+
+cells_fold
+```
+And we can use the functions `analysis()` and `assessment()` to access the respective folds in this further split. The `tune` package contains high-level functions that can help with resampling but one can also employ a `recipe` or specify a `workflow`.
+
+## Workflows for resampling
+
+Using a workflow":
+
+```{r workflow}
+cells_workflow <-
+  workflow() %>%
+  add_model(cells_random_forest) %>%
+  # we need to specify the formula as we are not using a recipe:
+  add_formula(class ~ .)
+```
+
+And fit a new model, very similarly to how we would to it without the resampling:
+
+```{r fit-fold}
+cells_rf_fit_resampling <-
+  cells_workflow %>%
+  # specify the resample object
+  fit_resamples(cells_fold)
+  # we do not specify the fit() attribute as the formula is included in the workflow!
+
+cells_rf_fit_resampling
+```
+
+The `.metrics` contains, indeed, the metrics of the model. Instead of manually extracting and averaging them, we use a function from the `tune` package:
+
+```{r}
+cells_rf_fit_resampling %>%
+  collect_metrics()
+```
+# Predictions
+
+Suppose we are done with tuning and this is our final model. We can then proceed to predictions:
+
+```{r cells_predictions}
+cells_predictions <-
+  cells_rf_fit %>%
+  predict(cells_test) %>%
+  bind_cols(
+    cells_rf_fit %>%
+      predict(cells_test, type = 'prob')
+  ) %>%
+  bind_cols(
+    cells_test %>%
+      select(class)
+  )
+
+cells_predictions
+```
+# Model Evaluation
+
+## Confusion Matrix
+
+```{r conf_mat}
+cells_predictions %>%
+  conf_mat(class, .pred_class) %>%
+  autoplot(type = 'heatmap')
+```
+The model appears to be quite imprecise! Let's look more closely at accuracy.
+
+```{r}
+cells_predictions %>%
+  metrics(class, .pred_class)
+```
+And finally, the receiver operating characteristic (ROC) curve:
+
+```{r}
+cells_predictions %>%
+  roc_curve(class, .pred_PS) %>%
+  autoplot()
+
+cells_predictions %>%
+  roc_auc(class, .pred_PS)
+```
+
